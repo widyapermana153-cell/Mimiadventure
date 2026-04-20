@@ -6,14 +6,11 @@
   <meta name="apple-mobile-web-app-capable" content="yes"/>
   <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent"/>
   <meta name="apple-mobile-web-app-title" content="Mimi Adventure"/>
-  <!-- PWA manifest inline -->
-  <link rel="manifest" href="data:application/json,{%22name%22:%22Mimi%20Adventure%22,%22short_name%22:%22Mimi%22,%22display%22:%22fullscreen%22,%22background_color%22:%22%231a0e2e%22,%22theme_color%22:%22%23b85080%22}"/>
   <title>Mimi Adventure 🐱</title>
   <style>
     *{margin:0;padding:0;box-sizing:border-box;}
     html,body{width:100%;height:100%;overflow:hidden;background:#0e0520;}
     body{touch-action:none;-webkit-touch-callout:none;-webkit-user-select:none;user-select:none;font-family:Georgia,serif;}
-    /* NO CSS width/height on canvas — iOS Safari bug fix */
     #gc{position:fixed;top:0;left:0;display:block;}
 
     #hud{
@@ -27,14 +24,27 @@
     }
     .hi{font-size:17px;font-weight:bold;letter-spacing:.04em;}
     #hl{color:#ff8ec8;} #hs{color:#ffe060;}
-    #ht{color:rgba(255,210,240,0.45);font-size:11px;font-style:italic;letter-spacing:.08em;}
+    #ht{color:rgba(255,210,240,0.45);font-size:11px;font-style:italic;letter-spacing:.06em;}
 
-    /* Mute button */
+    /* Checkpoint indicator */
+    #cp-flash{
+      position:fixed;top:55px;left:50%;transform:translateX(-50%);
+      background:rgba(80,200,120,0.92);color:#fff;
+      font-size:13px;font-weight:bold;font-family:Georgia,serif;
+      padding:6px 18px;border-radius:20px;
+      opacity:0;transition:opacity 0.3s;
+      pointer-events:none;z-index:40;
+      box-shadow:0 2px 12px rgba(0,0,0,0.4);
+      white-space:nowrap;
+    }
+    #cp-flash.show{opacity:1;}
+
     #mute-btn{
-      position:fixed;top:0;right:14px;
-      padding-top:max(10px,env(safe-area-inset-top));
-      font-size:22px;cursor:pointer;z-index:40;
-      background:none;border:none;line-height:2;
+      position:fixed;z-index:40;
+      right:14px;top:0;
+      padding-top:max(8px,env(safe-area-inset-top));
+      font-size:20px;cursor:pointer;
+      background:none;border:none;line-height:2.2;
       -webkit-tap-highlight-color:transparent;
     }
 
@@ -57,7 +67,8 @@
       -webkit-transform:translateZ(0);transform:translateZ(0);
     }
     .btn.on{background:rgba(160,38,108,0.85);transform:scale(0.87) translateZ(0);}
-    #bj{width:80px;height:80px;font-size:33px;background:rgba(130,28,88,0.82);border-color:rgba(255,130,195,0.42);}
+    #bj{width:80px;height:80px;font-size:33px;
+        background:rgba(130,28,88,0.82);border-color:rgba(255,130,195,0.42);}
   </style>
 </head>
 <body>
@@ -69,6 +80,7 @@
   <span class="hi" id="hs">🐟 0</span>
 </div>
 
+<div id="cp-flash">🏁 Checkpoint!</div>
 <button id="mute-btn" title="Mute/Unmute">🔊</button>
 
 <div id="controls">
@@ -82,253 +94,303 @@
 <script>
 'use strict';
 /* ================================================================
-   Mimi Adventure 🐱  – with Web Audio API Music & SFX
-   iOS Safari compatible. No external assets. Single file.
+   Mimi Adventure 🐱
+   - Web Audio API: music + SFX + cat meow/hiss synthesized
+   - Checkpoint system: respawn at last checkpoint
+   - Audio fix for GitHub Pages (no HTTPS restriction issues)
+   - iOS Safari compatible
    ================================================================ */
 
-// ─── Canvas ───────────────────────────────────────────────
+// ─── Canvas ──────────────────────────────────────────────
 const canvas = document.getElementById('gc');
 const ctx    = canvas.getContext('2d');
 let CW = 375, CH = 667;
-
 function resize(){
-  const w = window.innerWidth  || document.documentElement.clientWidth  || 375;
-  const h = window.innerHeight || document.documentElement.clientHeight || 667;
+  const w=window.innerWidth||document.documentElement.clientWidth||375;
+  const h=window.innerHeight||document.documentElement.clientHeight||667;
   if(w>10&&h>10){CW=w;CH=h;}
   canvas.width=CW; canvas.height=CH;
 }
 
 // ═══════════════════════════════════════════════════════════
-//  🎵  AUDIO ENGINE  (Web Audio API, zero external files)
+//  🎵  AUDIO ENGINE
+//  Key fix for GitHub Pages: AudioContext created lazily inside
+//  user gesture handler only. Never auto-created on load.
 // ═══════════════════════════════════════════════════════════
-let actx = null;   // AudioContext — created on first user gesture (iOS requirement)
+let AC  = null;   // AudioContext — created on first tap ONLY
 let muted = false;
-let bgmNodes = []; // refs so we can stop BGM
+let bgmNodes = [];
+let bgmTimer  = null;
+let bgmRunning = false;
 
-// Mute toggle button
 const muteBtn = document.getElementById('mute-btn');
-muteBtn.addEventListener('click', toggleMute);
-muteBtn.addEventListener('touchstart', e => { e.preventDefault(); toggleMute(); }, {passive:false});
+muteBtn.addEventListener('click',       e=>{ e.stopPropagation(); toggleMute(); });
+muteBtn.addEventListener('touchstart',  e=>{ e.preventDefault(); e.stopPropagation(); toggleMute(); },{passive:false});
 
 function toggleMute(){
-  muted = !muted;
-  muteBtn.textContent = muted ? '🔇' : '🔊';
-  if(actx){
-    // iOS: suspend/resume context to truly mute
-    if(muted){ stopBGM(); }
-    else { startBGM(); }
-  }
+  muted=!muted;
+  muteBtn.textContent=muted?'🔇':'🔊';
+  if(muted){ stopBGM(); }
+  else if(gst==='playing'){ startBGM(); }
 }
 
-// Create AudioContext on first touch/click (iOS policy)
-function ensureAudio(){
-  if(actx) return;
-  try {
-    actx = new (window.AudioContext || window.webkitAudioContext)();
-  } catch(e){ actx = null; }
+// Call this inside EVERY user-gesture handler (tap/click/keydown)
+function ensureAC(){
+  if(AC) return true;
+  try{
+    AC = new (window.AudioContext||window.webkitAudioContext)();
+    return true;
+  }catch(e){ return false; }
 }
 
-// ── Master volume helper ──────────────────────────────────
-function masterGain(val=0.18){
-  const g = actx.createGain();
-  g.gain.value = muted ? 0 : val;
-  g.connect(actx.destination);
-  return g;
+// Resume if suspended (iOS puts context to sleep when tab goes background)
+function resumeAC(){
+  if(AC && AC.state==='suspended') AC.resume();
 }
 
-// ── Basic oscillator note ─────────────────────────────────
-// type: 'sine'|'square'|'triangle'|'sawtooth'
-function playNote(freq, dur, vol=0.12, type='sine', delay=0, detune=0){
-  if(!actx || muted) return;
-  const now = actx.currentTime + delay;
-  const osc = actx.createOscillator();
-  const gn  = actx.createGain();
-  osc.type = type;
-  osc.frequency.setValueAtTime(freq, now);
-  osc.detune.setValueAtTime(detune, now);
-  gn.gain.setValueAtTime(vol, now);
-  gn.gain.exponentialRampToValueAtTime(0.0001, now + dur);
-  osc.connect(gn); gn.connect(actx.destination);
-  osc.start(now); osc.stop(now + dur + 0.05);
+// ── Low-level helpers ────────────────────────────────────
+
+// Create a gain node connected to destination
+function mkGain(vol){
+  const g=AC.createGain(); g.gain.value=muted?0:vol; g.connect(AC.destination); return g;
 }
 
-// ── SFX ──────────────────────────────────────────────────
+// Play a simple oscillator note
+function playNote(freq,dur,vol,type,delay){
+  if(!AC||muted) return;
+  const now=AC.currentTime+(delay||0);
+  const o=AC.createOscillator(), g=mkGain(vol||0.1);
+  o.type=type||'sine';
+  o.frequency.setValueAtTime(freq,now);
+  g.gain.setValueAtTime(vol||0.1,now);
+  g.gain.exponentialRampToValueAtTime(0.0001,now+dur);
+  o.connect(g); o.start(now); o.stop(now+dur+0.02);
+}
+
+// White-noise burst (for percussion / hiss texture)
+function playNoise(dur,vol,delay){
+  if(!AC||muted) return;
+  const now=AC.currentTime+(delay||0);
+  const buf=AC.createBuffer(1,Math.ceil(AC.sampleRate*dur),AC.sampleRate);
+  const d=buf.getChannelData(0);
+  for(let i=0;i<d.length;i++) d[i]=(Math.random()*2-1);
+  const src=AC.createBufferSource();
+  const g=mkGain(vol||0.08);
+  // Shape with gain envelope
+  g.gain.setValueAtTime(vol||0.08,now);
+  g.gain.exponentialRampToValueAtTime(0.0001,now+dur);
+  src.buffer=buf; src.connect(g); src.start(now); src.stop(now+dur+0.02);
+}
+
+// ── SFX ─────────────────────────────────────────────────
 
 function sfxJump(){
-  if(!actx||muted) return;
-  // Rising chirp
-  const now=actx.currentTime;
-  const osc=actx.createOscillator(), g=actx.createGain();
-  osc.type='sine';
-  osc.frequency.setValueAtTime(280,now);
-  osc.frequency.exponentialRampToValueAtTime(560,now+0.12);
-  g.gain.setValueAtTime(0.18,now);
-  g.gain.exponentialRampToValueAtTime(0.0001,now+0.18);
-  osc.connect(g);g.connect(actx.destination);
-  osc.start(now);osc.stop(now+0.22);
-}
-
-function sfxCollect(){
-  if(!actx||muted) return;
-  // Bright sparkle arpeggio
-  [523,659,784,1047].forEach((f,i)=>playNote(f,0.1,0.13,'sine',i*0.045));
-}
-
-function sfxStomp(){
-  if(!actx||muted) return;
-  // Thump + high chirp
-  const now=actx.currentTime;
-  // Low thump
-  const o1=actx.createOscillator(),g1=actx.createGain();
-  o1.type='sine';
-  o1.frequency.setValueAtTime(120,now);
-  o1.frequency.exponentialRampToValueAtTime(40,now+0.15);
-  g1.gain.setValueAtTime(0.3,now);
-  g1.gain.exponentialRampToValueAtTime(0.0001,now+0.18);
-  o1.connect(g1);g1.connect(actx.destination);
-  o1.start(now);o1.stop(now+0.2);
-  // High chirp
-  playNote(880,0.08,0.1,'square',0.02);
-}
-
-function sfxHurt(){
-  if(!actx||muted) return;
-  // Descending buzz
-  const now=actx.currentTime;
-  const osc=actx.createOscillator(),g=actx.createGain();
-  osc.type='sawtooth';
-  osc.frequency.setValueAtTime(440,now);
-  osc.frequency.exponentialRampToValueAtTime(110,now+0.3);
-  g.gain.setValueAtTime(0.22,now);
-  g.gain.exponentialRampToValueAtTime(0.0001,now+0.35);
-  osc.connect(g);g.connect(actx.destination);
-  osc.start(now);osc.stop(now+0.38);
-}
-
-function sfxWin(){
-  if(!actx||muted) return;
-  // Triumphant arpeggio
-  const melody=[523,659,784,1047,1319,1568];
-  melody.forEach((f,i)=>playNote(f,0.18,0.15,'sine',i*0.1));
-  // Final chord
-  [523,659,784].forEach(f=>playNote(f,0.6,0.12,'sine',0.65));
-}
-
-function sfxGameOver(){
-  if(!actx||muted) return;
-  // Sad descending melody
-  [494,440,392,349,330].forEach((f,i)=>playNote(f,0.22,0.14,'triangle',i*0.14));
+  if(!AC||muted) return;
+  // Rising sine chirp
+  const now=AC.currentTime;
+  const o=AC.createOscillator(),g=mkGain(0.15);
+  o.type='sine';
+  o.frequency.setValueAtTime(260,now);
+  o.frequency.exponentialRampToValueAtTime(540,now+0.13);
+  g.gain.setValueAtTime(0.15,now);
+  g.gain.exponentialRampToValueAtTime(0.0001,now+0.16);
+  o.connect(g);o.start(now);o.stop(now+0.18);
 }
 
 function sfxLand(){
-  if(!actx||muted) return;
-  const now=actx.currentTime;
-  const buf=actx.createBuffer(1,actx.sampleRate*0.06,actx.sampleRate);
-  const d=buf.getChannelData(0);
-  for(let i=0;i<d.length;i++) d[i]=(Math.random()*2-1)*Math.pow(1-i/d.length,3)*0.5;
-  const src=actx.createBufferSource(),g=actx.createGain();
-  src.buffer=buf;g.gain.value=0.12;
-  src.connect(g);g.connect(actx.destination);
-  src.start(now);
+  if(!AC||muted) return;
+  playNoise(0.06,0.10);
 }
 
-// ── Background Music ──────────────────────────────────────
-// Cute looping chiptune melody generated with oscillators
-// Scale: C major pentatonic → [C,D,E,G,A] = [261,294,330,392,440,523,587,659,784,880]
-const BGM_MELODY = [
-  // Bar 1 – main theme
+// 😸 Cat MEOW — synthesized formant approximation
+// Uses two oscillators with frequency glide: "mrrr-eow"
+function sfxMeow(){
+  if(!AC||muted) return;
+  const now=AC.currentTime;
+
+  // Main "meow" tone — starts mid, dips, rises, falls
+  const o1=AC.createOscillator(), g1=mkGain(0.18);
+  o1.type='triangle';
+  o1.frequency.setValueAtTime(420, now);
+  o1.frequency.linearRampToValueAtTime(380, now+0.06);
+  o1.frequency.linearRampToValueAtTime(600, now+0.20);
+  o1.frequency.exponentialRampToValueAtTime(300, now+0.42);
+  g1.gain.setValueAtTime(0,now);
+  g1.gain.linearRampToValueAtTime(0.18,now+0.04);
+  g1.gain.setValueAtTime(0.18,now+0.28);
+  g1.gain.exponentialRampToValueAtTime(0.0001,now+0.44);
+  o1.connect(g1);o1.start(now);o1.stop(now+0.46);
+
+  // Harmonic overlay for "cat-ness"
+  const o2=AC.createOscillator(), g2=mkGain(0.07);
+  o2.type='sawtooth';
+  o2.frequency.setValueAtTime(840, now);
+  o2.frequency.linearRampToValueAtTime(760, now+0.06);
+  o2.frequency.linearRampToValueAtTime(1200,now+0.20);
+  o2.frequency.exponentialRampToValueAtTime(600, now+0.42);
+  g2.gain.setValueAtTime(0,now);
+  g2.gain.linearRampToValueAtTime(0.07,now+0.06);
+  g2.gain.exponentialRampToValueAtTime(0.0001,now+0.44);
+  o2.connect(g2);o2.start(now);o2.stop(now+0.46);
+
+  // Sparkle collect sound on top
+  [523,784,1047].forEach((f,i)=>playNote(f,0.09,0.10,'sine',i*0.04));
+}
+
+// 😾 Cat HISS — synthesized angry cat sound
+function sfxHiss(){
+  if(!AC||muted) return;
+  const now=AC.currentTime;
+
+  // Hiss: pitched noise + angry growl tone
+  // Noise layer (filtered)
+  const buf=AC.createBuffer(1,Math.ceil(AC.sampleRate*0.4),AC.sampleRate);
+  const d=buf.getChannelData(0);
+  for(let i=0;i<d.length;i++) d[i]=(Math.random()*2-1);
+  const src=AC.createBufferSource();
+  // Bandpass filter to shape noise into "ssss" hiss
+  const bpf=AC.createBiquadFilter();
+  bpf.type='bandpass'; bpf.frequency.value=3200; bpf.Q.value=1.2;
+  const g1=mkGain(0.22);
+  g1.gain.setValueAtTime(0.22,now);
+  g1.gain.exponentialRampToValueAtTime(0.0001,now+0.38);
+  src.buffer=buf;src.connect(bpf);bpf.connect(g1);src.start(now);src.stop(now+0.4);
+
+  // Low growl underneath: descending sawtooth
+  const o=AC.createOscillator(),g2=mkGain(0.14);
+  o.type='sawtooth';
+  o.frequency.setValueAtTime(280,now+0.02);
+  o.frequency.exponentialRampToValueAtTime(80,now+0.38);
+  g2.gain.setValueAtTime(0.14,now+0.02);
+  g2.gain.exponentialRampToValueAtTime(0.0001,now+0.4);
+  o.connect(g2);o.start(now+0.02);o.stop(now+0.42);
+}
+
+function sfxStomp(){
+  if(!AC||muted) return;
+  const now=AC.currentTime;
+  const o=AC.createOscillator(),g=mkGain(0.28);
+  o.type='sine';
+  o.frequency.setValueAtTime(130,now);
+  o.frequency.exponentialRampToValueAtTime(40,now+0.16);
+  g.gain.setValueAtTime(0.28,now);g.gain.exponentialRampToValueAtTime(0.0001,now+0.18);
+  o.connect(g);o.start(now);o.stop(now+0.2);
+  playNote(880,0.08,0.10,'square',0.02);
+}
+
+function sfxWin(){
+  if(!AC||muted) return;
+  [523,659,784,1047,1319,1568].forEach((f,i)=>playNote(f,0.18,0.14,'sine',i*0.1));
+  [523,659,784].forEach(f=>playNote(f,0.6,0.11,'sine',0.65));
+  // Happy meow at end
+  setTimeout(()=>sfxMeow(), 900);
+}
+
+function sfxGameOver(){
+  if(!AC||muted) return;
+  [494,440,392,349,330].forEach((f,i)=>playNote(f,0.22,0.13,'triangle',i*0.14));
+}
+
+function sfxCheckpoint(){
+  if(!AC||muted) return;
+  // Bright ascending chime
+  [659,784,1047,1319].forEach((f,i)=>playNote(f,0.15,0.12,'sine',i*0.06));
+  // Gentle meow after
+  setTimeout(()=>sfxMeow(), 350);
+}
+
+// ── Background Music ─────────────────────────────────────
+// Cute chiptune loop: melody + bass + hi-hat percussion
+// All generated with Web Audio oscillators — no files needed
+
+const MELODY=[
   [523,0.18],[659,0.18],[784,0.18],[880,0.18],[784,0.18],[659,0.18],[523,0.36],
-  // Bar 2
   [440,0.18],[523,0.18],[659,0.18],[784,0.18],[659,0.18],[523,0.18],[440,0.36],
-  // Bar 3 – high run
   [523,0.12],[587,0.12],[659,0.12],[784,0.12],[880,0.12],[1047,0.24],[880,0.12],[784,0.36],
-  // Bar 4 – resolve
   [659,0.18],[587,0.18],[523,0.18],[440,0.18],[392,0.18],[330,0.18],[262,0.54],
 ];
-
-const BGM_BASS = [
-  // Simple walking bass line (plays simultaneously)
+const BASS=[
   [131,0.36],[165,0.36],[196,0.36],[220,0.36],
   [131,0.36],[165,0.36],[196,0.36],[220,0.36],
   [131,0.36],[165,0.36],[196,0.36],[220,0.36],
   [131,0.36],[165,0.36],[196,0.36],[110,0.72],
 ];
 
-let bgmScheduled = false;
-let bgmTimeout   = null;
-
-function scheduleMelody(notes, startTime, vol, type){
-  if(!actx) return 0;
-  let t = startTime;
-  for(const [freq, dur] of notes){
-    if(!muted){
-      const osc = actx.createOscillator();
-      const gn  = actx.createGain();
-      osc.type  = type;
-      osc.frequency.setValueAtTime(freq, t);
-      gn.gain.setValueAtTime(vol, t);
-      gn.gain.setValueAtTime(vol, t + dur - 0.02);
-      gn.gain.linearRampToValueAtTime(0, t + dur);
-      osc.connect(gn); gn.connect(actx.destination);
-      osc.start(t); osc.stop(t + dur + 0.01);
-      bgmNodes.push(osc);
-    }
-    t += dur;
+function schedMelody(notes,startT,vol,type){
+  if(!AC||muted) return 0;
+  let t=startT;
+  for(const[freq,dur]of notes){
+    const o=AC.createOscillator(),g=mkGain(vol);
+    o.type=type;
+    o.frequency.setValueAtTime(freq,t);
+    g.gain.setValueAtTime(vol,t);
+    g.gain.setValueAtTime(vol,t+dur-0.02);
+    g.gain.linearRampToValueAtTime(0,t+dur);
+    o.connect(g);o.start(t);o.stop(t+dur+0.01);
+    bgmNodes.push(o);
+    t+=dur;
   }
-  return t; // total duration
+  return t;
 }
 
 function startBGM(){
-  if(!actx || muted || bgmScheduled) return;
-  bgmScheduled = true;
-  scheduleBGMLoop();
+  if(!AC||muted||bgmRunning) return;
+  bgmRunning=true;
+  loopBGM();
 }
 
-function scheduleBGMLoop(){
-  if(!actx || muted){ bgmScheduled=false; return; }
-  const now = actx.currentTime;
-  const melEnd = scheduleMelody(BGM_MELODY, now, 0.10, 'triangle');
-  scheduleMelody(BGM_BASS,   now, 0.07, 'sine');
-  // Add simple percussion (hi-hat noise)
-  for(let b=0;b<8;b++){
-    const bt = now + b * (melEnd/8);
-    const buf = actx.createBuffer(1, actx.sampleRate*0.04, actx.sampleRate);
-    const d   = buf.getChannelData(0);
-    for(let i=0;i<d.length;i++) d[i]=(Math.random()*2-1)*Math.pow(1-i/d.length,2)*0.18;
-    const src = actx.createBufferSource(), gn=actx.createGain();
-    src.buffer=buf; gn.gain.value=muted?0:0.05;
-    src.connect(gn);gn.connect(actx.destination);
-    src.start(bt);
+function loopBGM(){
+  if(!AC||muted){bgmRunning=false;return;}
+  const now=AC.currentTime;
+  const end=schedMelody(MELODY,now,0.09,'triangle');
+  schedMelody(BASS,now,0.07,'sine');
+  // Hi-hat: short noise bursts on beat
+  const beats=8;
+  for(let b=0;b<beats;b++){
+    const bt=now+b*(end-now)/beats;
+    const buf=AC.createBuffer(1,Math.ceil(AC.sampleRate*0.035),AC.sampleRate);
+    const dd=buf.getChannelData(0);
+    for(let i=0;i<dd.length;i++) dd[i]=(Math.random()*2-1)*Math.pow(1-i/dd.length,2);
+    const src=AC.createBufferSource(),g=mkGain(0.04);
+    src.buffer=buf;src.connect(g);src.start(bt);
     bgmNodes.push(src);
   }
-  // Schedule next loop
-  const loopMs = melEnd * 1000 - 80;
-  bgmTimeout = setTimeout(()=>{ if(!muted) scheduleBGMLoop(); else bgmScheduled=false; }, loopMs);
+  const loopMs=(end-now)*1000-80;
+  bgmTimer=setTimeout(()=>{ if(!muted&&bgmRunning) loopBGM(); else bgmRunning=false; },loopMs);
 }
 
 function stopBGM(){
-  bgmScheduled = false;
-  if(bgmTimeout){ clearTimeout(bgmTimeout); bgmTimeout=null; }
-  bgmNodes.forEach(n=>{ try{n.stop();}catch(e){} });
-  bgmNodes = [];
+  bgmRunning=false;
+  if(bgmTimer){clearTimeout(bgmTimer);bgmTimer=null;}
+  bgmNodes.forEach(n=>{try{n.stop();}catch(e){}});
+  bgmNodes=[];
 }
 
 // ═══════════════════════════════════════════════════════════
 //  🎮  GAME ENGINE
 // ═══════════════════════════════════════════════════════════
-
 const GRAV=0.48,JFORCE=-12.5,PSPD=3.8,ESPD=1.0,INVMS=1800;
 
-let gst='title', score=0, lives=3;
-const EL_L=document.getElementById('hl'), EL_S=document.getElementById('hs');
-function hud(){ EL_L.textContent='🐾 '+lives; EL_S.textContent='🐟 '+score; }
+let gst='title',score=0,lives=3;
+const EL_L=document.getElementById('hl'),EL_S=document.getElementById('hs');
+function hud(){EL_L.textContent='🐾 '+lives;EL_S.textContent='🐟 '+score;}
 hud();
+
+// Checkpoint flash UI
+const cpFlash=document.getElementById('cp-flash');
+let cpFlashTimer=null;
+function showCPFlash(num){
+  cpFlash.textContent=`🏁 Checkpoint ${num} tersimpan!`;
+  cpFlash.classList.add('show');
+  if(cpFlashTimer) clearTimeout(cpFlashTimer);
+  cpFlashTimer=setTimeout(()=>cpFlash.classList.remove('show'),2000);
+}
 
 // ── Input ─────────────────────────────────────────────────
 const T={left:false,right:false,jump:false};
 function bindBtn(id,key){
   const el=document.getElementById(id);
-  const on =()=>{T[key]=true; el.classList.add('on');};
+  const on=()=>{T[key]=true;el.classList.add('on');};
   const off=()=>{T[key]=false;el.classList.remove('on');};
   el.addEventListener('touchstart', e=>{e.preventDefault();on(); },{passive:false});
   el.addEventListener('touchend',   e=>{e.preventDefault();off();},{passive:false});
@@ -337,8 +399,8 @@ function bindBtn(id,key){
 }
 bindBtn('bl','left');bindBtn('br','right');bindBtn('bj','jump');
 const K={};
-window.addEventListener('keydown',e=>K[e.code]=true);
-window.addEventListener('keyup',  e=>K[e.code]=false);
+window.addEventListener('keydown',e=>{ensureAC();resumeAC();K[e.code]=true;});
+window.addEventListener('keyup',  e=>{K[e.code]=false;});
 const isL=()=>T.left ||K.ArrowLeft ||K.KeyA;
 const isR=()=>T.right||K.ArrowRight||K.KeyD;
 const isJ=()=>T.jump ||K.ArrowUp   ||K.KeyW||K.KeyZ||K.Space;
@@ -346,14 +408,17 @@ const isJ=()=>T.jump ||K.ArrowUp   ||K.KeyW||K.KeyZ||K.Space;
 // ── Camera ────────────────────────────────────────────────
 const cam={x:0,y:0};
 
-// ── Level data ────────────────────────────────────────────
+// ── Level ─────────────────────────────────────────────────
 const LW=5800,GY=420;
+
 const PLATS=[
+  // Ground sections (ungu)
   {x:0,   y:GY,w:680,h:28,c:'#6a3878'},{x:730, y:GY,w:380,h:28,c:'#6a3878'},
   {x:1160,y:GY,w:460,h:28,c:'#6a3878'},{x:1680,y:GY,w:330,h:28,c:'#6a3878'},
   {x:2080,y:GY,w:420,h:28,c:'#6a3878'},{x:2580,y:GY,w:380,h:28,c:'#6a3878'},
   {x:3040,y:GY,w:560,h:28,c:'#6a3878'},{x:3680,y:GY,w:480,h:28,c:'#6a3878'},
   {x:4240,y:GY,w:640,h:28,c:'#6a3878'},{x:4960,y:GY,w:840,h:28,c:'#6a3878'},
+  // Elevated platforms (pink)
   {x:160, y:330,w:140,h:16,c:'#b85080'},{x:360, y:270,w:120,h:16,c:'#b85080'},
   {x:550, y:210,w:130,h:16,c:'#b85080'},{x:780, y:290,w:130,h:16,c:'#a04070'},
   {x:980, y:340,w:120,h:16,c:'#a04070'},{x:1200,y:310,w:140,h:16,c:'#b85080'},
@@ -369,6 +434,28 @@ const PLATS=[
   {x:5210,y:250,w:130,h:16,c:'#a04070'},{x:5400,y:180,w:160,h:16,c:'#a04070'},
   {x:5620,y:300,w:150,h:16,c:'#b85080'},
 ];
+
+// ── Checkpoints ───────────────────────────────────────────
+// Each checkpoint: { x, y } = world position of the flag
+// Player respawns here when they have one saved
+const CHECKPOINT_DEFS = [
+  { x:  950, y: GY-36,  num: 1 },   // ~1/5 level
+  { x: 2000, y: GY-36,  num: 2 },   // ~1/3 level
+  { x: 3100, y: GY-36,  num: 3 },   // ~1/2 level
+  { x: 4200, y: GY-36,  num: 4 },   // ~2/3 level
+  { x: 5100, y: GY-36,  num: 5 },   // ~5/6 level
+];
+const CP_W=22, CP_H=36;
+let checkpoints=[]; // built at level start
+
+function buildCheckpoints(){
+  checkpoints=CHECKPOINT_DEFS.map(d=>({...d,w:CP_W,h:CP_H,reached:false,animT:Math.random()*Math.PI*2}));
+}
+
+// Current spawn point (updated when checkpoint reached)
+let spawnX=50, spawnY=GY-26-1;
+
+// Enemy defs
 const EDEFS=[
   {pi:2,ox:30,d:1},{pi:5,ox:20,d:-1},{pi:8,ox:40,d:1},
   {pi:11,ox:10,d:-1},{pi:14,ox:20,d:1},{pi:17,ox:10,d:-1},
@@ -377,6 +464,8 @@ const EDEFS=[
   {pi:0,ox:180,d:1},{pi:1,ox:60,d:-1},{pi:3,ox:40,d:1},
   {pi:6,ox:120,d:-1},{pi:9,ox:200,d:1},
 ];
+
+// Snack defs: t=0 fish, t=1 star
 const SDEFS=[
   {x:180,y:308,t:0},{x:380,y:248,t:1},{x:570,y:188,t:0},
   {x:800,y:268,t:1},{x:1000,y:318,t:0},{x:1220,y:288,t:1},
@@ -386,6 +475,7 @@ const SDEFS=[
   {x:3290,y:218,t:1},{x:3460,y:158,t:0},{x:4490,y:248,t:1},
   {x:4680,y:178,t:0},{x:5420,y:158,t:1},
 ];
+
 const PCOL=['#e74c8a','#4cace7','#e7c04c','#7c4ce7','#4ce78a'];
 const EW=20,EH=28,PW=28,PH=26,SW=18,SH=18;
 let enemies=[],snacks=[];
@@ -393,16 +483,19 @@ const portal={x:5640,y:GY-60,w:52,h:60,at:0};
 
 // ── Player ────────────────────────────────────────────────
 let P={};
-let wasOnGround=false; // for land SFX
-
 function resetP(){
-  P={x:50,y:GY-PH,vx:0,vy:0,w:PW,h:PH,
-     onG:false,cj:true,fr:true,inv:0,alive:true,dt:0,tw:0};
-  wasOnGround=false;
+  P={
+    x:spawnX, y:spawnY,
+    vx:0,vy:0,w:PW,h:PH,
+    onG:false,cj:true,fr:true,
+    inv:0,alive:true,dt:0,tw:0
+  };
 }
 resetP();
 
 function buildLevel(){
+  spawnX=50; spawnY=GY-PH-1;
+  buildCheckpoints();
   enemies=EDEFS.map(d=>{
     const p=PLATS[d.pi];if(!p)return null;
     return{x:p.x+d.ox,y:p.y-EH,w:EW,h:EH,vx:ESPD*d.d,
@@ -417,7 +510,9 @@ function buildLevel(){
 buildLevel();
 
 // ── Physics ───────────────────────────────────────────────
-function overlap(ax,ay,aw,ah,bx,by,bw,bh){return ax<bx+bw&&ax+aw>bx&&ay<by+bh&&ay+ah>by;}
+function overlap(ax,ay,aw,ah,bx,by,bw,bh){
+  return ax<bx+bw&&ax+aw>bx&&ay<by+bh&&ay+ah>by;
+}
 function resolveP(e){
   e.onG=false;
   for(const p of PLATS){
@@ -430,15 +525,37 @@ function resolveP(e){
   }
 }
 
+// ── Damage / respawn ──────────────────────────────────────
 function dmg(){
   if(P.inv>0||!P.alive)return;
-  sfxHurt();
+  sfxHiss();          // 😾 Angry cat hiss when hit
   lives--;hud();
   if(lives<=0){gst='gameover';stopBGM();sfxGameOver();}
   else{P.alive=false;P.dt=1400;}
 }
-function respawn(){resetP();P.inv=INVMS;}
+function respawn(){
+  // Respawn at last reached checkpoint (or start)
+  resetP();
+  P.inv=INVMS;
+}
 
+// ── Update checkpoints ────────────────────────────────────
+function updCheckpoints(){
+  for(const cp of checkpoints){
+    if(cp.reached)continue;
+    cp.animT+=0.03;
+    if(P.alive&&overlap(P.x,P.y,P.w,P.h,cp.x,cp.y,cp.w,cp.h)){
+      cp.reached=true;
+      // Save spawn point at this checkpoint
+      spawnX=cp.x;
+      spawnY=cp.y;
+      sfxCheckpoint();       // Chime + meow!
+      showCPFlash(cp.num);   // Show UI flash
+    }
+  }
+}
+
+// ── Update player ─────────────────────────────────────────
 let jheld=false;
 function updP(dt){
   if(!P.alive){P.dt-=dt;if(P.dt<=0)respawn();return;}
@@ -454,11 +571,11 @@ function updP(dt){
   P.vy+=GRAV;if(P.vy>16)P.vy=16;
   P.x+=P.vx;resolveP(P);
   P.y+=P.vy;resolveP(P);
-  // Land sound: was in air, now on ground
-  if(!prevOnG&&P.onG&&P.vy>=0) sfxLand();
+  if(!prevOnG&&P.onG&&P.vy>=0)sfxLand();
   if(P.y>GY+200)dmg();
   if(P.x<0)P.x=0;if(P.x+P.w>LW)P.x=LW-P.w;
 }
+
 function updE(dt){
   for(const e of enemies){
     if(!e.alive)continue;
@@ -466,22 +583,29 @@ function updE(dt){
     if(e.x<=e.px||e.x+e.w>=e.px+e.pw){e.vx*=-1;e.x=Math.max(e.px,Math.min(e.x,e.px+e.pw-e.w));}
     if(!P.alive||P.inv>0)continue;
     if(overlap(P.x,P.y,P.w,P.h,e.x,e.y,e.w,e.h)){
-      if(P.vy>0&&P.y+P.h<e.y+e.h*0.45){e.alive=false;P.vy=JFORCE*0.65;score+=5;hud();sfxStomp();}
-      else dmg();
+      if(P.vy>0&&P.y+P.h<e.y+e.h*0.45){
+        e.alive=false;P.vy=JFORCE*0.65;score+=5;hud();sfxStomp();
+      }else dmg();
     }
   }
 }
+
 function updS(){
   for(const s of snacks){
     if(s.done)continue;
-    if(P.alive&&overlap(P.x,P.y,P.w,P.h,s.x,s.y,s.w,s.h)){s.done=true;score+=10;hud();sfxCollect();}
+    if(P.alive&&overlap(P.x,P.y,P.w,P.h,s.x,s.y,s.w,s.h)){
+      s.done=true;score+=10;hud();
+      sfxMeow();  // 😸 Happy cat meow when collecting snack!
+    }
   }
 }
+
 function updPortal(){
   if(P.alive&&overlap(P.x,P.y,P.w,P.h,portal.x,portal.y,portal.w,portal.h)){
     gst='win';stopBGM();sfxWin();
   }
 }
+
 function updCam(){
   const sc=scl(),vw=CW/sc,vh=CH/sc;
   cam.x=Math.max(0,Math.min(P.x-vw/2+P.w/2,LW-vw));
@@ -494,16 +618,13 @@ function wx(v){return(v-cam.x)*scl();}
 function wy(v){return(v-cam.y)*scl();}
 function ws(v){return v*scl();}
 
-// ── Draw helpers ──────────────────────────────────────────
 function rrect(x,y,w,h,r,fill,stroke,lw){
-  if(w<=0||h<=0)return;
-  r=Math.min(r,w/2,h/2);
+  if(w<=0||h<=0)return;r=Math.min(r,w/2,h/2);
   ctx.beginPath();
   ctx.moveTo(x+r,y);ctx.lineTo(x+w-r,y);ctx.arcTo(x+w,y,x+w,y+r,r);
   ctx.lineTo(x+w,y+h-r);ctx.arcTo(x+w,y+h,x+w-r,y+h,r);
   ctx.lineTo(x+r,y+h);ctx.arcTo(x,y+h,x,y+h-r,r);
-  ctx.lineTo(x,y+r);ctx.arcTo(x,y,x+r,y,r);
-  ctx.closePath();
+  ctx.lineTo(x,y+r);ctx.arcTo(x,y,x+r,y,r);ctx.closePath();
   if(fill){ctx.fillStyle=fill;ctx.fill();}
   if(stroke){ctx.strokeStyle=stroke;ctx.lineWidth=lw||1.5;ctx.stroke();}
 }
@@ -520,19 +641,15 @@ function drawBG(t){
   mg.addColorStop(0,'#fffae0');mg.addColorStop(0.7,'#ffe880');mg.addColorStop(1,'rgba(255,220,80,0)');
   ctx.fillStyle=mg;ctx.beginPath();ctx.arc(mx,my,mr,0,Math.PI*2);ctx.fill();
   // Stars
-  const stars=[[60,28],[200,45],[350,18],[490,60],[650,32],[780,55],
-               [120,100],[280,85],[450,115],[610,78],[40,155],[220,135],[400,158]];
+  const stars=[[60,28],[200,45],[350,18],[490,60],[650,32],[780,55],[120,100],[280,85],[450,115],[610,78],[40,155],[220,135],[400,158]];
   const px2=cam.x*0.10;
   for(const[sx,sy]of stars){
     const tw=0.35+0.65*Math.abs(Math.sin(t*0.0004+sx*0.1));
     ctx.globalAlpha=tw;ctx.fillStyle='#fff';
-    for(let ti=0;ti<6;ti++){
-      const rx=((sx+ti*900-px2)%CW+CW)%CW;
-      ctx.beginPath();ctx.arc(rx,sy,1.1,0,Math.PI*2);ctx.fill();
-    }
+    for(let ti=0;ti<6;ti++){const rx=((sx+ti*900-px2)%CW+CW)%CW;ctx.beginPath();ctx.arc(rx,sy,1.1,0,Math.PI*2);ctx.fill();}
   }
   ctx.globalAlpha=1;
-  // Distant trees
+  // Trees
   const gmx=cam.x*0.15;
   ctx.fillStyle='rgba(38,12,62,0.5)';
   for(let i=0;i<14;i++){
@@ -541,6 +658,55 @@ function drawBG(t){
     const bh=48+(i%3)*16;
     ctx.fillRect(rx-3,CH-bh,6,bh);
     ctx.beginPath();ctx.moveTo(rx-16,CH-bh+6);ctx.lineTo(rx,CH-bh-22);ctx.lineTo(rx+16,CH-bh+6);ctx.closePath();ctx.fill();
+  }
+}
+
+// ── Draw checkpoints ──────────────────────────────────────
+function drawCheckpoints(t){
+  for(const cp of checkpoints){
+    const sx=wx(cp.x), sy=wy(cp.y);
+    if(sx+ws(cp.w)<0||sx>CW) continue;
+
+    const reached=cp.reached;
+    const flagColor = reached ? '#44dd88' : '#ffdd44';
+    const poleColor = reached ? '#33aa66' : '#ccaa33';
+
+    // Pole
+    ctx.strokeStyle=poleColor; ctx.lineWidth=ws(2.5); ctx.lineCap='round';
+    ctx.beginPath();
+    ctx.moveTo(sx+ws(cp.w/2), sy+ws(cp.h));
+    ctx.lineTo(sx+ws(cp.w/2), sy);
+    ctx.stroke();
+
+    // Flag wave animation
+    const wave = reached ? 0 : Math.sin(t*0.004+cp.animT)*ws(2);
+    ctx.fillStyle=flagColor;
+    ctx.strokeStyle=poleColor; ctx.lineWidth=ws(1);
+    ctx.beginPath();
+    ctx.moveTo(sx+ws(cp.w/2), sy);
+    ctx.lineTo(sx+ws(cp.w/2)+ws(14)+wave, sy+ws(5));
+    ctx.lineTo(sx+ws(cp.w/2)+ws(12)+wave*0.5, sy+ws(12));
+    ctx.lineTo(sx+ws(cp.w/2), sy+ws(12));
+    ctx.closePath(); ctx.fill(); ctx.stroke();
+
+    // Number on flag
+    ctx.fillStyle = reached ? '#fff' : '#333';
+    ctx.font=`bold ${ws(7)}px Georgia`;ctx.textAlign='center';
+    ctx.fillText(cp.num, sx+ws(cp.w/2)+ws(8)+wave*0.3, sy+ws(9));
+
+    // Base
+    rrect(sx+ws(cp.w/2)-ws(6), sy+ws(cp.h)-ws(4), ws(12), ws(5), ws(2), poleColor);
+
+    // Glow if not yet reached
+    if(!reached){
+      ctx.strokeStyle='rgba(255,220,60,0.3)'; ctx.lineWidth=ws(6);
+      ctx.beginPath(); ctx.arc(sx+ws(cp.w/2), sy+ws(cp.h/2), ws(18), 0, Math.PI*2); ctx.stroke();
+    }
+    // Green checkmark if reached
+    if(reached){
+      ctx.fillStyle='rgba(80,255,150,0.25)';
+      ctx.beginPath(); ctx.arc(sx+ws(cp.w/2), sy+ws(cp.h/2), ws(14), 0, Math.PI*2); ctx.fill();
+    }
   }
 }
 
@@ -571,8 +737,7 @@ function drawEnemies(){
     if(!e.alive)continue;
     const sx=wx(e.x),sy=wy(e.y),sw=ws(e.w),sh=ws(e.h);
     if(sx+sw<0||sx>CW)continue;
-    const cx2=sx+sw/2,cy2=sy+sh/2;
-    ctx.save();ctx.translate(cx2,cy2);ctx.rotate(e.rot);
+    ctx.save();ctx.translate(sx+sw/2,sy+sh/2);ctx.rotate(e.rot);
     const pr=ws(8.5),ph=ws(12);
     ctx.fillStyle='#f2f2f2';
     ctx.beginPath();ctx.arc(0,-ph/2,pr,Math.PI,0);ctx.rect(-pr,-ph/2,pr*2,ph);ctx.arc(0,ph/2,pr,0,Math.PI);ctx.fill();
@@ -626,8 +791,8 @@ function drawSnacks(t){
 function drawPortal(t){
   const sx=wx(portal.x),sy=wy(portal.y),sw=ws(portal.w),sh=ws(portal.h);
   if(sx+sw<0||sx>CW)return;
-  const cx2=sx+sw/2,pls=Math.sin(portal.at+t*0.002)*0.08+1;
-  ctx.save();ctx.translate(cx2,sy+sh/2+sh*0.1);
+  const pls=Math.sin(portal.at+t*0.002)*0.08+1;
+  ctx.save();ctx.translate(sx+sw/2,sy+sh/2+sh*0.1);
   ctx.strokeStyle='rgba(255,180,80,0.13)';ctx.lineWidth=ws(16);
   ctx.beginPath();ctx.ellipse(0,0,sw*0.72*pls,sh*0.46*pls,0,0,Math.PI*2);ctx.stroke();
   ctx.fillStyle='#d4b040';ctx.strokeStyle='#b09030';ctx.lineWidth=ws(2.5);
@@ -649,8 +814,8 @@ function drawPortal(t){
 function drawMimi(t){
   if(!P.alive)return;
   if(P.inv>0&&Math.floor(t/80)%2===0)return;
-  const sx=wx(P.x),sy=wy(P.y),sw=ws(P.w),sh=ws(P.h);
-  const cx2=sx+sw/2,cy2=sy+sh/2,dir=P.fr?1:-1,mov=Math.abs(P.vx)>0.1;
+  const cx2=wx(P.x)+ws(P.w/2),cy2=wy(P.y)+ws(P.h/2);
+  const dir=P.fr?1:-1,mov=Math.abs(P.vx)>0.1;
   ctx.save();ctx.translate(cx2,cy2);ctx.scale(dir,1);
   // Tail
   const tw=Math.sin(P.tw)*(mov?0.5:0.22);
@@ -670,7 +835,7 @@ function drawMimi(t){
   ctx.fillStyle='#f2f2f2';ctx.strokeStyle='#ccc';ctx.lineWidth=ws(0.8);
   ctx.beginPath();ctx.moveTo(ws(9),-ws(18));ctx.lineTo(ws(14),-ws(27));ctx.lineTo(ws(3),-ws(21));ctx.closePath();ctx.fill();ctx.stroke();
   ctx.fillStyle='#ffb0ca';ctx.beginPath();ctx.moveTo(ws(9.5),-ws(19));ctx.lineTo(ws(13),-ws(25.5));ctx.lineTo(ws(4),-ws(21.5));ctx.closePath();ctx.fill();
-  // Eyes
+  // Eyes (bigger when airborne)
   const ew=P.onG?ws(3.2):ws(4.3),eh=P.onG?ws(3.8):ws(5);
   ctx.fillStyle='#1a1a2e';
   ctx.beginPath();ctx.ellipse(-ws(4.5),-ws(10),ew,eh,0,0,Math.PI*2);ctx.fill();
@@ -701,7 +866,7 @@ function drawMimi(t){
   ctx.restore();
 }
 
-// ── Overlays ──────────────────────────────────────────────
+// ── Draw overlays ─────────────────────────────────────────
 function drawOverlay(title,sub,hint){
   ctx.fillStyle='rgba(8,2,18,0.90)';ctx.fillRect(0,0,CW,CH);
   ctx.textAlign='center';
@@ -710,7 +875,7 @@ function drawOverlay(title,sub,hint){
   ctx.font=`bold ${Math.min(CW*0.072,50)}px Georgia`;
   ctx.fillText(title,CW/2,CH/2-50);ctx.shadowBlur=0;
   ctx.fillStyle='#c090b0';
-  ctx.font=`${Math.min(CW*0.038,22)}px Georgia`;
+  ctx.font=`${Math.min(CW*0.038,21)}px Georgia`;
   ctx.fillText(sub,CW/2,CH/2+4);
   ctx.fillStyle='#806070';
   ctx.font=`${Math.min(CW*0.026,15)}px Georgia`;
@@ -754,42 +919,42 @@ function drawTitle(){
   ctx.beginPath();ctx.moveTo(-16,12);ctx.quadraticCurveTo(-28,2,-22,-12);ctx.stroke();
   ctx.restore();
   ctx.fillStyle='#a070a0';
-  ctx.font=`${Math.min(CW*0.036,18)}px Georgia`;
-  ctx.fillText('Kumpulkan 🐟 ikan & ⭐ snack',CW/2,CH*0.64);
-  ctx.fillText('Hindari 💊 pil obat!',CW/2,CH*0.71);
-  ctx.fillStyle='#604858';
+  ctx.font=`${Math.min(CW*0.034,17)}px Georgia`;
+  ctx.fillText('Kumpulkan 🐟 ikan & ⭐ snack',CW/2,CH*0.63);
+  ctx.fillText('Hindari 💊 pil obat! Injak dari atas untuk kalahkan!',CW/2,CH*0.70);
+  ctx.fillStyle='#7a5878';
   ctx.font=`${Math.min(CW*0.026,13)}px Georgia`;
-  ctx.fillText('Injak pil dari ATAS untuk mengalahkannya',CW/2,CH*0.77);
+  ctx.fillText('🏁 Ada 5 checkpoint — Mimi tidak perlu mulai dari awal!',CW/2,CH*0.77);
   const bw=Math.min(200,CW*0.52),bh=54,bx=CW/2-bw/2,by=CH*0.83;
   rrect(bx,by,bw,bh,14,'rgba(145,32,92,0.92)','rgba(255,128,185,0.55)',2);
   ctx.fillStyle='#fff';ctx.font=`bold ${Math.min(CW*0.042,23)}px Georgia`;
   ctx.fillText('▶  MAIN!',CW/2,by+37);
-  // Note about music
-  ctx.fillStyle='rgba(180,140,170,0.55)';
+  ctx.fillStyle='rgba(160,120,150,0.5)';
   ctx.font=`${Math.min(CW*0.022,12)}px Georgia`;
-  ctx.fillText('🔊 Ketuk tombol MAIN untuk mengaktifkan musik',CW/2,CH*0.96);
+  ctx.fillText('🔊 Musik aktif setelah tap — gunakan 🔊 untuk mute',CW/2,CH*0.97);
 }
 
-// ── Restart / tap ─────────────────────────────────────────
+// ── Restart ───────────────────────────────────────────────
 function restart(){
   score=0;lives=3;gst='playing';
-  hud();resetP();buildLevel();cam.x=0;cam.y=0;
+  hud();buildLevel();resetP();cam.x=0;cam.y=0;
   stopBGM();
-  // Small delay to let AudioContext settle on iOS
-  setTimeout(()=>startBGM(), 100);
+  setTimeout(()=>{ if(!muted) startBGM(); },150);
 }
 
+// Main tap/click handler
+// CRITICAL: ensureAC() and resumeAC() must be called HERE
+// inside the actual user gesture event, not in a setTimeout
 function handleTap(e){
   e.preventDefault();
-  // CRITICAL for iOS: AudioContext must be created/resumed inside user gesture
-  ensureAudio();
-  if(actx && actx.state==='suspended') actx.resume();
+  ensureAC();   // Create AudioContext on first gesture (iOS requirement)
+  resumeAC();   // Resume if suspended (iOS background tab)
   if(gst==='title'||gst==='gameover'||gst==='win') restart();
 }
 canvas.addEventListener('touchstart',handleTap,{passive:false});
 canvas.addEventListener('click',handleTap);
 window.addEventListener('keydown',e=>{
-  ensureAudio();
+  ensureAC();resumeAC();
   if((gst==='title'||gst==='gameover'||gst==='win')&&e.code==='KeyR') restart();
 });
 
@@ -803,22 +968,40 @@ function loop(ts){
   setCtrl(true);
   if(gst==='playing'){
     portal.at+=dt*0.002;
-    updP(dt);updE(dt);updS();updPortal();updCam();
+    updP(dt);updE(dt);updS();updCheckpoints();updPortal();updCam();
   }
   ctx.clearRect(0,0,CW,CH);
-  drawBG(ts);drawPlats();drawPortal(ts);drawSnacks(ts);drawEnemies();drawMimi(ts);
+  drawBG(ts);
+  drawCheckpoints(ts);  // Draw flags behind platforms
+  drawPlats();
+  drawPortal(ts);
+  drawSnacks(ts);
+  drawEnemies();
+  drawMimi(ts);
   if(!P.alive&&P.dt>0){
     ctx.fillStyle=`rgba(255,50,80,${Math.min(0.4,P.dt/4000)})`;ctx.fillRect(0,0,CW,CH);
     ctx.fillStyle='#fff';ctx.textAlign='center';
     ctx.font=`bold ${Math.min(CW*0.046,26)}px Georgia`;
-    ctx.fillText('Mimi jatuh... 😿',CW/2,CH/2);
+    ctx.fillText('Mimi jatuh... 😿',CW/2,CH/2-16);
+    // Show respawn location
+    const cpReached=checkpoints.filter(c=>c.reached);
+    const cpInfo=cpReached.length>0?`Respawn di Checkpoint ${cpReached[cpReached.length-1].num}`:'Respawn dari awal';
+    ctx.font=`${Math.min(CW*0.030,16)}px Georgia`;
+    ctx.fillStyle='rgba(255,200,200,0.85)';
+    ctx.fillText(cpInfo,CW/2,CH/2+14);
   }
-  if(gst==='gameover'){setCtrl(false);drawOverlay('GAME OVER 😿',`Skor: ${score}  ·  Snack: ${score/10|0}`,'Ayo coba lagi, Mimi bisa!');}
-  if(gst==='win'){setCtrl(false);drawOverlay('MIMI MENANG! 😸🎉',`Skor: ${score}  ·  Snack: ${score/10|0} 🐟`,'Nyam nyam! Semua snack habis!');}
+  if(gst==='gameover'){
+    setCtrl(false);
+    drawOverlay('GAME OVER 😿',`Skor: ${score}  ·  Snack: ${score/10|0}`,'Ayo coba lagi, Mimi bisa!');
+  }
+  if(gst==='win'){
+    setCtrl(false);
+    drawOverlay('MIMI MENANG! 😸🎉',`Skor: ${score}  ·  Snack: ${score/10|0} 🐟`,'Nyam nyam! Semua snack habis!');
+  }
   requestAnimationFrame(loop);
 }
 
-// ── Init ──────────────────────────────────────────────────
+// ── Init ─────────────────────────────────────────────────
 function init(){
   resize();
   if(CW<10||CH<10){CW=canvas.width=375;CH=canvas.height=667;}
@@ -826,7 +1009,8 @@ function init(){
   document.addEventListener('touchstart',e=>{if(e.target===document.body)e.preventDefault();},{passive:false});
   requestAnimationFrame(ts=>{last=ts;requestAnimationFrame(loop);});
 }
-if(document.readyState==='complete'){init();}else{window.addEventListener('load',init);}
+if(document.readyState==='complete'){init();}
+else{window.addEventListener('load',init);}
 window.addEventListener('resize',()=>resize());
 window.addEventListener('orientationchange',()=>setTimeout(resize,200));
 </script>
